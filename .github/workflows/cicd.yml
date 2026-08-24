@@ -58,7 +58,7 @@ jobs:
     if: github.repository == 'microsoft/ntosebpfext'
     runs-on:
       - self-hosted
-      - 1ES.Pool=ebpf-cicd-runner-pool-server-2019
+      - 1ES.Pool=ebpf-extensions-cicd-runner-pool
       - 1ES.ImageOverride=server2022_v2
       - JobId=ntos-smoke-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
