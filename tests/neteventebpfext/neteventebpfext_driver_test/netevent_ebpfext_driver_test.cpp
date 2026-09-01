@@ -17,6 +17,7 @@
 #include "utils.h"
 #include "watchdog.h"
 
+#include <atomic>
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <ebpf_api.h>
@@ -36,9 +37,25 @@ CATCH_REGISTER_LISTENER(cxplat_passed_test_log)
 
 struct bpf_map* netevent_event_map;
 struct bpf_map* command_map;
-static volatile uint32_t event_count = 0;
-static volatile uint32_t log_event_count = 0;
-static volatile uint32_t drop_event_count = 0;
+static std::atomic<uint32_t> event_count = 0;
+static std::atomic<uint32_t> log_event_count = 0;
+static std::atomic<uint32_t> drop_event_count = 0;
+
+template <typename condition_t>
+static bool
+_wait_for_condition(condition_t condition)
+{
+    constexpr uint32_t wait_interval_seconds = 5;
+    constexpr uint32_t timeout_seconds = 90;
+
+    for (uint32_t elapsed_seconds = 0; elapsed_seconds < timeout_seconds; elapsed_seconds += wait_interval_seconds) {
+        if (condition()) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(wait_interval_seconds));
+    }
+    return condition();
+}
 
 typedef struct test_netevent_event_md
 {
@@ -182,45 +199,59 @@ TEST_CASE("netevent_attach_opt_simulation", "[neteventebpfext]")
     REQUIRE(netevent_monitor_link == nullptr);
 
     // Test attach with capture valid capture type
-    uint32_t event_count_before = event_count;
-    uint32_t log_event_count_before = log_event_count;
-    uint32_t drop_event_count_before = drop_event_count;
+    uint32_t event_count_before = event_count.load();
+    uint32_t log_event_count_before = log_event_count.load();
 
     attach_opts.capture_type = NeteventCapture_All;
     result = ebpf_program_attach(
         netevent_monitor, &EBPF_ATTACH_TYPE_NETEVENT, &attach_opts, sizeof(attach_opts), &netevent_monitor_link);
     REQUIRE(result == EBPF_SUCCESS);
     REQUIRE(netevent_monitor_link != nullptr);
-    std::this_thread::sleep_for(std::chrono::seconds(5));
+
+    uint32_t event_count_after = 0;
+    uint32_t log_event_count_after = 0;
+    _wait_for_condition([&]() {
+        event_count_after = event_count.load();
+        log_event_count_after = log_event_count.load();
+        return log_event_count_after > log_event_count_before &&
+               event_count_after - event_count_before == log_event_count_after - log_event_count_before;
+    });
 
     // Detach the program (link) from the attach point.
     int link_fd = bpf_link__fd(netevent_monitor_link);
     bpf_link_detach(link_fd);
     bpf_link__destroy(netevent_monitor_link);
+    netevent_monitor_link = nullptr;
 
-    // Test that only expected event counts have increased
-    std::this_thread::sleep_for(std::chrono::seconds(5));
-    REQUIRE(log_event_count_before < log_event_count);
-    REQUIRE((event_count - event_count_before) == (log_event_count - log_event_count_before));
+    REQUIRE(log_event_count_before < log_event_count_after);
+    REQUIRE((event_count_after - event_count_before) == (log_event_count_after - log_event_count_before));
 
     // Test reattach with different capture type
-    event_count_before = event_count;
+    event_count_before = event_count.load();
+    uint32_t drop_event_count_before = drop_event_count.load();
     attach_opts.capture_type = NeteventCapture_Drop;
     result = ebpf_program_attach(
         netevent_monitor, &EBPF_ATTACH_TYPE_NETEVENT, &attach_opts, sizeof(attach_opts), &netevent_monitor_link);
     REQUIRE(result == EBPF_SUCCESS);
     REQUIRE(netevent_monitor_link != nullptr);
-    std::this_thread::sleep_for(std::chrono::seconds(5));
+
+    event_count_after = 0;
+    uint32_t drop_event_count_after = 0;
+    _wait_for_condition([&]() {
+        event_count_after = event_count.load();
+        drop_event_count_after = drop_event_count.load();
+        return drop_event_count_after > drop_event_count_before &&
+               event_count_after - event_count_before == drop_event_count_after - drop_event_count_before;
+    });
 
     // Detach the program (link) from the attach point.
     link_fd = bpf_link__fd(netevent_monitor_link);
     bpf_link_detach(link_fd);
     bpf_link__destroy(netevent_monitor_link);
+    netevent_monitor_link = nullptr;
 
-    // Test that only expected event counts have increased
-    std::this_thread::sleep_for(std::chrono::seconds(5));
-    REQUIRE(drop_event_count_before < drop_event_count);
-    REQUIRE((event_count - event_count_before) == (drop_event_count - drop_event_count_before));
+    REQUIRE(drop_event_count_before < drop_event_count_after);
+    REQUIRE((event_count_after - event_count_before) == (drop_event_count_after - drop_event_count_before));
 
     // Close perf buffer.
     perf_buffer__free(netevent_perf_buff);
