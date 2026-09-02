@@ -41,7 +41,7 @@ static std::atomic<uint32_t> event_count = 0;
 static std::atomic<uint32_t> log_event_count = 0;
 static std::atomic<uint32_t> drop_event_count = 0;
 static constexpr uint32_t wait_interval_seconds = 5;
-static constexpr uint32_t timeout_seconds = 90;
+static constexpr uint32_t timeout_seconds = 15;
 
 template <typename condition_t>
 static bool
