@@ -40,14 +40,13 @@ struct bpf_map* command_map;
 static std::atomic<uint32_t> event_count = 0;
 static std::atomic<uint32_t> log_event_count = 0;
 static std::atomic<uint32_t> drop_event_count = 0;
+static constexpr uint32_t wait_interval_seconds = 5;
+static constexpr uint32_t timeout_seconds = 90;
 
 template <typename condition_t>
 static bool
 _wait_for_condition(condition_t condition)
 {
-    constexpr uint32_t wait_interval_seconds = 5;
-    constexpr uint32_t timeout_seconds = 90;
-
     for (uint32_t elapsed_seconds = 0; elapsed_seconds < timeout_seconds; elapsed_seconds += wait_interval_seconds) {
         if (condition()) {
             return true;
@@ -55,6 +54,21 @@ _wait_for_condition(condition_t condition)
         std::this_thread::sleep_for(std::chrono::seconds(wait_interval_seconds));
     }
     return condition();
+}
+
+static bool
+_wait_for_events_to_drain()
+{
+    uint32_t previous_event_count = event_count.load();
+    for (uint32_t elapsed_seconds = 0; elapsed_seconds < timeout_seconds; elapsed_seconds += wait_interval_seconds) {
+        std::this_thread::sleep_for(std::chrono::seconds(wait_interval_seconds));
+        uint32_t current_event_count = event_count.load();
+        if (current_event_count == previous_event_count) {
+            return true;
+        }
+        previous_event_count = current_event_count;
+    }
+    return false;
 }
 
 typedef struct test_netevent_event_md
@@ -208,14 +222,7 @@ TEST_CASE("netevent_attach_opt_simulation", "[neteventebpfext]")
     REQUIRE(result == EBPF_SUCCESS);
     REQUIRE(netevent_monitor_link != nullptr);
 
-    uint32_t event_count_after = 0;
-    uint32_t log_event_count_after = 0;
-    _wait_for_condition([&]() {
-        event_count_after = event_count.load();
-        log_event_count_after = log_event_count.load();
-        return log_event_count_after > log_event_count_before &&
-               event_count_after - event_count_before == log_event_count_after - log_event_count_before;
-    });
+    _wait_for_condition([&]() { return log_event_count.load() > log_event_count_before; });
 
     // Detach the program (link) from the attach point.
     int link_fd = bpf_link__fd(netevent_monitor_link);
@@ -223,6 +230,9 @@ TEST_CASE("netevent_attach_opt_simulation", "[neteventebpfext]")
     bpf_link__destroy(netevent_monitor_link);
     netevent_monitor_link = nullptr;
 
+    REQUIRE(_wait_for_events_to_drain());
+    uint32_t event_count_after = event_count.load();
+    uint32_t log_event_count_after = log_event_count.load();
     REQUIRE(log_event_count_before < log_event_count_after);
     REQUIRE((event_count_after - event_count_before) == (log_event_count_after - log_event_count_before));
 
@@ -235,14 +245,7 @@ TEST_CASE("netevent_attach_opt_simulation", "[neteventebpfext]")
     REQUIRE(result == EBPF_SUCCESS);
     REQUIRE(netevent_monitor_link != nullptr);
 
-    event_count_after = 0;
-    uint32_t drop_event_count_after = 0;
-    _wait_for_condition([&]() {
-        event_count_after = event_count.load();
-        drop_event_count_after = drop_event_count.load();
-        return drop_event_count_after > drop_event_count_before &&
-               event_count_after - event_count_before == drop_event_count_after - drop_event_count_before;
-    });
+    _wait_for_condition([&]() { return drop_event_count.load() > drop_event_count_before; });
 
     // Detach the program (link) from the attach point.
     link_fd = bpf_link__fd(netevent_monitor_link);
@@ -250,6 +253,9 @@ TEST_CASE("netevent_attach_opt_simulation", "[neteventebpfext]")
     bpf_link__destroy(netevent_monitor_link);
     netevent_monitor_link = nullptr;
 
+    REQUIRE(_wait_for_events_to_drain());
+    event_count_after = event_count.load();
+    uint32_t drop_event_count_after = drop_event_count.load();
     REQUIRE(drop_event_count_before < drop_event_count_after);
     REQUIRE((event_count_after - event_count_before) == (drop_event_count_after - drop_event_count_before));
 
