@@ -17,9 +17,9 @@
 #include "utils.h"
 #include "watchdog.h"
 
-#include <atomic>
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
+#include <cerrno>
 #include <ebpf_api.h>
 #include <iostream>
 #include <string>
@@ -32,65 +32,50 @@ CATCH_REGISTER_LISTENER(cxplat_passed_test_log)
 
 struct bpf_map* netevent_event_map;
 struct bpf_map* command_map;
-static std::atomic<uint32_t> event_count = 0;
-static std::atomic<uint32_t> log_event_count = 0;
-static std::atomic<uint32_t> drop_event_count = 0;
-static constexpr std::chrono::seconds wait_interval{5};
+static uint32_t event_count = 0;
+static uint32_t log_event_count = 0;
+static uint32_t drop_event_count = 0;
+static constexpr std::chrono::milliseconds poll_interval{5000};
 static constexpr std::chrono::seconds event_timeout{90};
 static constexpr std::chrono::seconds stress_test_timeout{90};
 static constexpr size_t max_packet_size = 1600;
 
 struct netevent_callback_context
 {
-    std::atomic<uint8_t> expected_event_type = 0;
+    uint8_t expected_event_type = 0;
     bool validate_simulator_payload = false;
-    std::atomic<uint32_t> malformed_event_count = 0;
-    std::atomic<uint32_t> invalid_version_count = 0;
-    std::atomic<uint32_t> unknown_event_type_count = 0;
-    std::atomic<uint32_t> unexpected_event_type_count = 0;
-    std::atomic<uint32_t> mismatched_pktmon_event_id_count = 0;
-    std::atomic<uint32_t> invalid_payload_count = 0;
-    std::atomic<uint64_t> lost_event_count = 0;
+    uint32_t malformed_event_count = 0;
+    uint32_t invalid_version_count = 0;
+    uint32_t unknown_event_type_count = 0;
+    uint32_t unexpected_event_type_count = 0;
+    uint32_t mismatched_pktmon_event_id_count = 0;
+    uint32_t invalid_payload_count = 0;
+    uint64_t lost_event_count = 0;
 };
 
-template <typename condition_t>
-static bool
-_wait_for_condition(condition_t condition)
+static int
+_drain_perf_buffer(perf_buffer* perf_buffer)
 {
-    for (std::chrono::seconds elapsed = {}; elapsed < event_timeout; elapsed += wait_interval) {
-        if (condition()) {
-            return true;
+    auto deadline = std::chrono::steady_clock::now() + event_timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        int result = perf_buffer__poll(perf_buffer, static_cast<int>(poll_interval.count()));
+        if (result <= 0) {
+            return result;
         }
-        std::this_thread::sleep_for(wait_interval);
     }
-    return condition();
-}
-
-static bool
-_wait_for_events_to_drain()
-{
-    uint32_t previous_event_count = event_count.load();
-    for (std::chrono::seconds elapsed = {}; elapsed < event_timeout; elapsed += wait_interval) {
-        std::this_thread::sleep_for(wait_interval);
-        uint32_t current_event_count = event_count.load();
-        if (current_event_count == previous_event_count) {
-            return true;
-        }
-        previous_event_count = current_event_count;
-    }
-    return false;
+    return -ETIMEDOUT;
 }
 
 static void
 _require_no_callback_errors(const netevent_callback_context& context)
 {
-    REQUIRE(context.malformed_event_count.load() == 0);
-    REQUIRE(context.invalid_version_count.load() == 0);
-    REQUIRE(context.unknown_event_type_count.load() == 0);
-    REQUIRE(context.unexpected_event_type_count.load() == 0);
-    REQUIRE(context.mismatched_pktmon_event_id_count.load() == 0);
-    REQUIRE(context.invalid_payload_count.load() == 0);
-    REQUIRE(context.lost_event_count.load() == 0);
+    REQUIRE(context.malformed_event_count == 0);
+    REQUIRE(context.invalid_version_count == 0);
+    REQUIRE(context.unknown_event_type_count == 0);
+    REQUIRE(context.unexpected_event_type_count == 0);
+    REQUIRE(context.mismatched_pktmon_event_id_count == 0);
+    REQUIRE(context.invalid_payload_count == 0);
+    REQUIRE(context.lost_event_count == 0);
 }
 
 typedef struct test_netevent_event_md
@@ -127,7 +112,7 @@ netevent_monitor_event_callback(void* ctx, int cpu, void* data, uint32_t size)
         return;
     }
 
-    uint8_t expected_event_type = context.expected_event_type.load();
+    uint8_t expected_event_type = context.expected_event_type;
     if (expected_event_type != 0 && event_type != expected_event_type) {
         context.unexpected_event_type_count++;
     }
@@ -167,7 +152,7 @@ netevent_monitor_lost_event_callback(void* ctx, int cpu, __u64 cnt)
 {
     UNREFERENCED_PARAMETER(cpu);
     auto& context = *static_cast<netevent_callback_context*>(ctx);
-    context.lost_event_count.fetch_add(cnt);
+    context.lost_event_count += cnt;
 }
 
 TEST_CASE("netevent_attach_opt_simulation", "[neteventebpfext]")
@@ -207,14 +192,13 @@ TEST_CASE("netevent_attach_opt_simulation", "[neteventebpfext]")
     netevent_callback_context callback_context = {};
     callback_context.expected_event_type = NETEVENT_EVENT_TYPE_PKTMON_FLOW;
     callback_context.validate_simulator_payload = true;
-    ebpf_perf_buffer_opts perf_opts = {.sz = sizeof(ebpf_perf_buffer_opts), .flags = EBPF_PERFBUF_FLAG_AUTO_CALLBACK};
-    auto netevent_perf_buff = ebpf_perf_buffer__new(
+    auto netevent_perf_buff = perf_buffer__new(
         bpf_map__fd(netevent_events_map),
         0,
         netevent_monitor_event_callback,
         netevent_monitor_lost_event_callback,
         &callback_context,
-        &perf_opts);
+        nullptr);
     REQUIRE(netevent_perf_buff != nullptr);
 
     // Test attach with no attach params - this should fail.
@@ -243,8 +227,8 @@ TEST_CASE("netevent_attach_opt_simulation", "[neteventebpfext]")
     REQUIRE(netevent_monitor_link == nullptr);
 
     // Test attach with capture valid capture type
-    uint32_t event_count_before = event_count.load();
-    uint32_t log_event_count_before = log_event_count.load();
+    uint32_t event_count_before = event_count;
+    uint32_t log_event_count_before = log_event_count;
 
     attach_opts.capture_type = NeteventCapture_All;
     result = ebpf_program_attach(
@@ -252,7 +236,9 @@ TEST_CASE("netevent_attach_opt_simulation", "[neteventebpfext]")
     REQUIRE(result == EBPF_SUCCESS);
     REQUIRE(netevent_monitor_link != nullptr);
 
-    _wait_for_condition([&]() { return log_event_count.load() > log_event_count_before; });
+    int poll_result =
+        perf_buffer__poll(netevent_perf_buff, static_cast<int>(std::chrono::milliseconds(event_timeout).count()));
+    REQUIRE(poll_result > 0);
 
     // Detach the program (link) from the attach point.
     int link_fd = bpf_link__fd(netevent_monitor_link);
@@ -260,15 +246,15 @@ TEST_CASE("netevent_attach_opt_simulation", "[neteventebpfext]")
     bpf_link__destroy(netevent_monitor_link);
     netevent_monitor_link = nullptr;
 
-    REQUIRE(_wait_for_events_to_drain());
-    uint32_t event_count_after = event_count.load();
-    uint32_t log_event_count_after = log_event_count.load();
+    REQUIRE(_drain_perf_buffer(netevent_perf_buff) >= 0);
+    uint32_t event_count_after = event_count;
+    uint32_t log_event_count_after = log_event_count;
     REQUIRE(log_event_count_before < log_event_count_after);
     REQUIRE((event_count_after - event_count_before) == (log_event_count_after - log_event_count_before));
 
     // Test reattach with different capture type
-    event_count_before = event_count.load();
-    uint32_t drop_event_count_before = drop_event_count.load();
+    event_count_before = event_count;
+    uint32_t drop_event_count_before = drop_event_count;
     callback_context.expected_event_type = NETEVENT_EVENT_TYPE_PKTMON_DROP;
     attach_opts.capture_type = NeteventCapture_Drop;
     result = ebpf_program_attach(
@@ -276,7 +262,9 @@ TEST_CASE("netevent_attach_opt_simulation", "[neteventebpfext]")
     REQUIRE(result == EBPF_SUCCESS);
     REQUIRE(netevent_monitor_link != nullptr);
 
-    _wait_for_condition([&]() { return drop_event_count.load() > drop_event_count_before; });
+    poll_result =
+        perf_buffer__poll(netevent_perf_buff, static_cast<int>(std::chrono::milliseconds(event_timeout).count()));
+    REQUIRE(poll_result > 0);
 
     // Detach the program (link) from the attach point.
     link_fd = bpf_link__fd(netevent_monitor_link);
@@ -284,9 +272,9 @@ TEST_CASE("netevent_attach_opt_simulation", "[neteventebpfext]")
     bpf_link__destroy(netevent_monitor_link);
     netevent_monitor_link = nullptr;
 
-    REQUIRE(_wait_for_events_to_drain());
-    event_count_after = event_count.load();
-    uint32_t drop_event_count_after = drop_event_count.load();
+    REQUIRE(_drain_perf_buffer(netevent_perf_buff) >= 0);
+    event_count_after = event_count;
+    uint32_t drop_event_count_after = drop_event_count;
     REQUIRE(drop_event_count_before < drop_event_count_after);
     REQUIRE((event_count_after - event_count_before) == (drop_event_count_after - drop_event_count_before));
     _require_no_callback_errors(callback_context);
@@ -350,14 +338,13 @@ TEST_CASE("netevent_drivers_load_unload_stress", "[neteventebpfext]")
     netevent_callback_context callback_context = {};
     callback_context.expected_event_type = NETEVENT_EVENT_TYPE_PKTMON_FLOW;
     callback_context.validate_simulator_payload = true;
-    ebpf_perf_buffer_opts perf_opts = {.sz = sizeof(ebpf_perf_buffer_opts), .flags = EBPF_PERFBUF_FLAG_AUTO_CALLBACK};
-    auto netevent_perf_buff = ebpf_perf_buffer__new(
+    auto netevent_perf_buff = perf_buffer__new(
         bpf_map__fd(netevent_events_map),
         0,
         netevent_monitor_event_callback,
         netevent_monitor_lost_event_callback,
         &callback_context,
-        &perf_opts);
+        nullptr);
     REQUIRE(netevent_perf_buff != nullptr);
 
     std::cout << "\n\n********** Test netevent_sim provider load/unload while the extension is running. **********"
@@ -371,7 +358,7 @@ TEST_CASE("netevent_drivers_load_unload_stress", "[neteventebpfext]")
 
         // Sample the event count before reloading the driver,
         // after waiting for any pending events to be processed, so they don't count later.
-        std::this_thread::sleep_for(std::chrono::seconds(10));
+        REQUIRE(_drain_perf_buffer(netevent_perf_buff) >= 0);
         uint32_t event_count_before = event_count;
 
         // Reload netevent_sim
@@ -381,7 +368,9 @@ TEST_CASE("netevent_drivers_load_unload_stress", "[neteventebpfext]")
         REQUIRE(netevent_sim_driver.start() == true);
 
         // Test that the event count has increased.
-        std::this_thread::sleep_for(std::chrono::seconds(5));
+        REQUIRE(
+            perf_buffer__poll(netevent_perf_buff, static_cast<int>(std::chrono::milliseconds(event_timeout).count())) >
+            0);
         REQUIRE(event_count > event_count_before);
     }
 
@@ -397,7 +386,7 @@ TEST_CASE("netevent_drivers_load_unload_stress", "[neteventebpfext]")
 
         // Sample the event count before reloading the driver,
         // after waiting for any pending events to be processed, so they don't count later.
-        std::this_thread::sleep_for(std::chrono::seconds(10));
+        REQUIRE(_drain_perf_buffer(netevent_perf_buff) >= 0);
         uint32_t event_count_before = event_count;
 
         // Reload neteventebpfext
@@ -407,7 +396,9 @@ TEST_CASE("netevent_drivers_load_unload_stress", "[neteventebpfext]")
         REQUIRE(neteventebpfext_driver.start() == true);
 
         // Test that the event count has increased.
-        std::this_thread::sleep_for(std::chrono::seconds(5));
+        REQUIRE(
+            perf_buffer__poll(netevent_perf_buff, static_cast<int>(std::chrono::milliseconds(event_timeout).count())) >
+            0);
         REQUIRE(event_count > event_count_before);
     }
 
@@ -415,7 +406,7 @@ TEST_CASE("netevent_drivers_load_unload_stress", "[neteventebpfext]")
     int link_fd = bpf_link__fd(netevent_monitor_link);
     bpf_link_detach(link_fd);
     bpf_link__destroy(netevent_monitor_link);
-    REQUIRE(_wait_for_events_to_drain());
+    REQUIRE(_drain_perf_buffer(netevent_perf_buff) >= 0);
     _require_no_callback_errors(callback_context);
 
     // Close perf buffer.
@@ -469,14 +460,13 @@ TEST_CASE("netevent_bpf_prog_run_test", "[neteventebpfext]")
     REQUIRE(netevent_events_map != nullptr);
     netevent_callback_context callback_context = {};
     callback_context.expected_event_type = NETEVENT_EVENT_TYPE_PKTMON_DROP;
-    ebpf_perf_buffer_opts perf_opts = {.sz = sizeof(ebpf_perf_buffer_opts), .flags = EBPF_PERFBUF_FLAG_AUTO_CALLBACK};
-    auto netevent_perf_buff = ebpf_perf_buffer__new(
+    auto netevent_perf_buff = perf_buffer__new(
         bpf_map__fd(netevent_events_map),
         0,
         netevent_monitor_event_callback,
         netevent_monitor_lost_event_callback,
         &callback_context,
-        &perf_opts);
+        nullptr);
     REQUIRE(netevent_perf_buff != nullptr);
 
     // Initialize structures required for bpf_prog_test_run_opts
@@ -541,7 +531,8 @@ TEST_CASE("netevent_bpf_prog_run_test", "[neteventebpfext]")
     REQUIRE(memcmp(test_data_in, data_out, test_pktmon_data_size) == 0);
     REQUIRE(bpf_opts.ctx_size_out == sizeof(netevent_ctx_out));
 
-    std::this_thread::sleep_for(std::chrono::seconds(5));
+    REQUIRE(
+        perf_buffer__poll(netevent_perf_buff, static_cast<int>(std::chrono::milliseconds(event_timeout).count())) > 0);
     REQUIRE(event_count == event_count_before + 1);
 
     // Negative test cases.
@@ -581,7 +572,7 @@ TEST_CASE("netevent_bpf_prog_run_test", "[neteventebpfext]")
     REQUIRE(link_fd != ebpf_fd_invalid);
     REQUIRE(bpf_link_detach(link_fd) == 0);
     REQUIRE(bpf_link__destroy(netevent_monitor_link) == 0);
-    REQUIRE(_wait_for_events_to_drain());
+    REQUIRE(_drain_perf_buffer(netevent_perf_buff) >= 0);
     _require_no_callback_errors(callback_context);
 
     // Free the perf buffer manager
